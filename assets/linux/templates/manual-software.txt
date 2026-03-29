@@ -1,0 +1,2 @@
+# name|version|executables(comma-separated)|notes
+# example-tool|1.2.3|example-tool,examplectl|installed from upstream tarball

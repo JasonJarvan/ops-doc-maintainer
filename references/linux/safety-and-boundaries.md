@@ -1,0 +1,34 @@
+# Safety And Boundaries
+
+- Prefer read-only commands.
+- If a command is missing or access is denied, record partial status and continue.
+- Redact secrets:
+  - do not store passwords
+  - do not store private keys
+  - do not store complete DSNs or tokens
+- For PostgreSQL, record only:
+  - connection method
+  - host port mapping
+  - default user or database name when a config source exposes them
+  - compose or config file path
+- Do not inspect PostgreSQL internals such as:
+  - databases
+  - roles
+  - active sessions
+- For SSH, record only key effective settings such as:
+  - listen address
+  - port
+  - `PermitRootLogin`
+  - `PasswordAuthentication`
+  - `PubkeyAuthentication`
+- For Nginx, keep:
+  - config paths
+  - listen directives
+  - server names
+  - upstream names
+  - certificate paths
+- For Docker, keep:
+  - running containers
+  - image names
+  - published ports
+  - restart policy

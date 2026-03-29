@@ -1,0 +1,9 @@
+# One item per line.
+# Supported prefixes:
+# service:
+# software:
+# port:
+# container:
+
+# container:buildx_buildkit_default
+# port:53

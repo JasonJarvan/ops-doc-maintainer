@@ -1,0 +1,11 @@
+# One item per line.
+# Supported prefixes:
+# service:
+# software:
+# port:
+# container:
+
+# service:nginx
+# software:@openai/codex
+# port:5432
+# container:postgres
