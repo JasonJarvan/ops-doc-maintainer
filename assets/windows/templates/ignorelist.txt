@@ -1,0 +1,11 @@
+# One item per line.
+# Supported prefixes:
+# service:
+# software:
+# port:
+# container:
+
+# port:5353
+# port:1900
+# service:SysMain
+# software:Microsoft.VCRedist.2015+.x64

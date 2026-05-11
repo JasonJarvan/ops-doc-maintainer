@@ -1,0 +1,7 @@
+interface:
+  display_name: "Win Ops Doc Maintainer"
+  short_description: "Maintain low-noise Windows ops docs"
+  default_prompt: "Use $win-ops-doc-maintainer to inventory this Windows host or update the shared ops docs after software or network changes."
+
+policy:
+  allow_implicit_invocation: true

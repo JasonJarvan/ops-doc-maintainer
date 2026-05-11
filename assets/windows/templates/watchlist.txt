@@ -1,0 +1,11 @@
+# One item per line.
+# Supported prefixes:
+# service:
+# software:
+# port:
+# container:
+
+# service:W3SVC
+# software:clash-verge
+# port:7890
+# container:postgres
