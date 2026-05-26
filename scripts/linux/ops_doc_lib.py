@@ -904,15 +904,18 @@ def meaningful_changes(previous: dict[str, Any] | None, current: dict[str, Any])
     if not previous:
         return ["Initialized ops documentation."]
 
+    def _port_key(item: dict) -> str:
+        if "addr" in item:
+            return item["addr"]
+        return f"{item.get('proto','')} {item.get('address','')}:{item.get('port','')}"
+
     changes: list[str] = []
-    prev_ports = {(item["proto"], item["address"], item["port"]) for item in previous["network"]["listening_ports"]}
-    curr_ports = {(item["proto"], item["address"], item["port"]) for item in current["network"]["listening_ports"]}
-    added_ports = sorted(curr_ports - prev_ports)
-    removed_ports = sorted(prev_ports - curr_ports)
-    for proto, address, port in added_ports:
-        changes.append(f"Listening port added: {proto} {address}:{port}")
-    for proto, address, port in removed_ports:
-        changes.append(f"Listening port removed: {proto} {address}:{port}")
+    prev_ports = {_port_key(item) for item in previous["network"]["listening_ports"]}
+    curr_ports = {_port_key(item) for item in current["network"]["listening_ports"]}
+    for addr in sorted(curr_ports - prev_ports):
+        changes.append(f"Listening port added: {addr}")
+    for addr in sorted(prev_ports - curr_ports):
+        changes.append(f"Listening port removed: {addr}")
 
     for service in ("docker", "nginx", "ssh"):
         prev_status = previous["services"][service]["status"]
