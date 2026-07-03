@@ -18,7 +18,8 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent.parent
-TEMPLATES = ROOT / "assets" / "templates"
+SKILL_ROOT = ROOT.parent
+TEMPLATES = SKILL_ROOT / "assets" / "linux" / "templates"
 DEFAULT_DOCS_HOME = Path.home() / ".ops-doc-maintainer-docs"
 POSTGRESQL_COMPOSE_PATH = Path("/home/shenzhou/Codes/Infra/postgresql/docker-compose.yml")
 BIN_DIRS = {
