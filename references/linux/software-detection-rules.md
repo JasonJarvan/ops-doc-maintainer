@@ -4,8 +4,10 @@ Track only manually installed global executable tools.
 
 Allowed sources:
 
-- `apt`: from `apt-mark showmanual`, filtered to packages that expose global executables
-- `snap`: only snaps that expose command names
+- `apt`: (Linux) from `apt-mark showmanual`, filtered to packages that expose global executables
+- `snap`: (Linux) only snaps that expose command names
+- `homebrew`: (macOS) Homebrew itself, plus `brew leaves --installed-on-request` formulae that expose executables under `$(brew --prefix)/opt/<formula>/{bin,sbin}` — never the full dependency closure
+- `homebrew-cask`: (macOS) `brew list --cask` entries, recorded separately from formulae
 - `npm`: only global top-level CLI packages
 - `pip`: only top-level requested packages with console scripts
 - `uv`: only `uv tool` installs

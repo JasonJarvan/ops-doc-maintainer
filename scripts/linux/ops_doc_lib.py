@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -31,6 +32,21 @@ BIN_DIRS = {
     "/usr/local/sbin",
 }
 
+PLATFORM = platform.system()
+IS_DARWIN = PLATFORM == "Darwin"
+
+# macOS-only helpers. Linux keeps its original code paths untouched.
+MACOS_APP_FIREWALL = "/usr/libexec/ApplicationFirewall/socketfilterfw"
+MACOS_BREW_PREFIXES = ("/opt/homebrew", "/usr/local")
+MACOS_SERVICES = {
+    "docker": {"labels": ("com.docker.",), "command": "docker"},
+    "nginx": {"labels": ("homebrew.mxcl.nginx", "org.nginx"), "command": "nginx"},
+    "ssh": {"labels": ("com.openssh.sshd",), "command": "sshd"},
+    "sshd": {"labels": ("com.openssh.sshd",), "command": "sshd"},
+}
+
+_SEARCH_PATH_CACHE = None
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -44,17 +60,98 @@ def host_name() -> str:
     return socket.gethostname().split(".")[0]
 
 
+def _version_sort_key(name: str) -> tuple:
+    parts = re.findall(r"\d+", name)
+    return tuple(int(part) for part in parts) or (0,)
+
+
+def macos_extra_bin_dirs() -> list[str]:
+    """Bin directories that macOS logins add but non-login shells do not.
+
+    Agent runtimes frequently invoke this library with a bare
+    ``/usr/bin:/bin:/usr/sbin:/sbin`` PATH, which hides Homebrew, uv, nvm and
+    ``~/.local/bin`` tools. Linux is unaffected — this is only consulted on
+    Darwin.
+    """
+    home = Path.home()
+    candidates = [
+        Path("/opt/homebrew/bin"),
+        Path("/opt/homebrew/sbin"),
+        Path("/usr/local/bin"),
+        Path("/usr/local/sbin"),
+        home / ".local" / "bin",
+        home / ".cargo" / "bin",
+        home / "bin",
+    ]
+    nvm_root = home / ".nvm" / "versions" / "node"
+    try:
+        node_versions = [item for item in nvm_root.iterdir() if (item / "bin").is_dir()]
+    except OSError:
+        node_versions = []
+    if node_versions:
+        node_versions.sort(key=lambda item: _version_sort_key(item.name))
+        candidates.append(node_versions[-1] / "bin")
+    dirs = []
+    for candidate in candidates:
+        try:
+            if candidate.is_dir():
+                dirs.append(str(candidate))
+        except OSError:
+            continue
+    return dirs
+
+
+def search_path() -> str:
+    global _SEARCH_PATH_CACHE
+    if _SEARCH_PATH_CACHE is not None:
+        return _SEARCH_PATH_CACHE
+    base = os.environ.get("PATH", os.defpath)
+    if IS_DARWIN:
+        entries = base.split(os.pathsep)
+        for extra in macos_extra_bin_dirs():
+            if extra not in entries:
+                entries.append(extra)
+        base = os.pathsep.join(entries)
+    _SEARCH_PATH_CACHE = base
+    return base
+
+
+def which_command(name: str) -> str | None:
+    return shutil.which(name, path=search_path())
+
+
 def run(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd,
-        text=True,
-        capture_output=True,
-        check=check,
-    )
+    """Run a command, degrading to empty output instead of raising.
+
+    A missing binary or an OS-level launch failure is partial data, not a fatal
+    error (see ``references/linux/safety-and-boundaries.md``).
+    """
+    argv = list(cmd)
+    resolved = which_command(argv[0]) if argv else None
+    if resolved is None:
+        missing = argv[0] if argv else ""
+        return subprocess.CompletedProcess(argv, 127, "", f"command not found: {missing}")
+    argv[0] = resolved
+    env = None
+    if IS_DARWIN:
+        # Child processes need the same widened PATH: wrapper scripts such as
+        # `npm` use `#!/usr/bin/env node` and would otherwise fail.
+        env = dict(os.environ)
+        env["PATH"] = search_path()
+    try:
+        return subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            check=check,
+            env=env,
+        )
+    except OSError as exc:
+        return subprocess.CompletedProcess(argv, 127, "", str(exc))
 
 
 def command_exists(name: str) -> bool:
-    return shutil.which(name) is not None
+    return which_command(name) is not None
 
 
 def load_lines(path: Path) -> list[str]:
@@ -124,10 +221,7 @@ def normalize_records(records: list[dict[str, Any]], key: str) -> list[dict[str,
     return sorted(normalized, key=lambda item: json.dumps(item.get(key, item), sort_keys=True))
 
 
-def collect_network() -> dict[str, Any]:
-    ip_output = run(["hostname", "-I"]).stdout.strip()
-    ips = [ip for ip in ip_output.split() if ip]
-    default_route = run(["ip", "route", "show", "default"]).stdout.strip().splitlines()
+def resolv_conf_nameservers() -> list[str]:
     dns_servers = []
     resolv = Path("/etc/resolv.conf")
     if resolv.exists():
@@ -135,6 +229,14 @@ def collect_network() -> dict[str, Any]:
             line = line.strip()
             if line.startswith("nameserver "):
                 dns_servers.append(line.split(None, 1)[1])
+    return dns_servers
+
+
+def _collect_network_linux() -> dict[str, Any]:
+    ip_output = run(["hostname", "-I"]).stdout.strip()
+    ips = [ip for ip in ip_output.split() if ip]
+    default_route = run(["ip", "route", "show", "default"]).stdout.strip().splitlines()
+    dns_servers = resolv_conf_nameservers()
 
     listening_ports: list[dict[str, Any]] = []
     if command_exists("ss"):
@@ -169,14 +271,26 @@ def collect_network() -> dict[str, Any]:
                 "summary": [line for line in result.stdout.splitlines()[:12] if line.strip()],
             }
 
+    return {
+        "primary_ips": ips,
+        "default_route": default_route,
+        "dns_servers": dns_servers,
+        "listening_ports": listening_ports,
+        "firewall": firewall,
+    }
+
+
+def collect_network() -> dict[str, Any]:
+    parts = _collect_network_darwin() if IS_DARWIN else _collect_network_linux()
+    default_route = parts["default_route"]
     data = {
         "updated_at": now_iso(),
         "hostname": host_name(),
-        "primary_ips": sorted(ips),
+        "primary_ips": sorted(parts["primary_ips"]),
         "default_route": default_route[0] if default_route else "",
-        "dns_servers": sorted(dict.fromkeys(dns_servers)),
-        "listening_ports": normalize_records(listening_ports, "port"),
-        "firewall": firewall,
+        "dns_servers": sorted(dict.fromkeys(parts["dns_servers"])),
+        "listening_ports": normalize_records(parts["listening_ports"], "port"),
+        "firewall": parts["firewall"],
     }
     return data
 
@@ -200,6 +314,175 @@ def clean_process(text: str) -> str:
     return cleaned
 
 
+def _macos_primary_ips() -> list[str]:
+    ips: list[str] = []
+    for raw in run(["ifconfig"]).stdout.splitlines():
+        line = raw.strip()
+        if not (line.startswith("inet ") or line.startswith("inet6 ")):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        addr = parts[1].split("%", 1)[0]
+        if addr.startswith("127.") or addr == "::1" or addr.lower().startswith("fe80"):
+            continue
+        ips.append(addr)
+    return list(dict.fromkeys(ips))
+
+
+def _macos_default_route() -> list[str]:
+    result = run(["route", "-n", "get", "default"])
+    if result.returncode == 0:
+        info: dict[str, str] = {}
+        for raw in result.stdout.splitlines():
+            if ":" not in raw:
+                continue
+            key, value = raw.split(":", 1)
+            info[key.strip()] = value.strip()
+        gateway = info.get("gateway", "")
+        interface = info.get("interface", "")
+        if gateway or interface:
+            pieces = ["default"]
+            if gateway:
+                pieces.extend(["via", gateway])
+            if interface:
+                pieces.extend(["dev", interface])
+            return [" ".join(pieces)]
+
+    # Fallback when `route` is unavailable or the query failed.
+    for raw in run(["netstat", "-rn", "-f", "inet"]).stdout.splitlines():
+        parts = raw.split()
+        if len(parts) >= 4 and parts[0] == "default":
+            return ["default via {0} dev {1}".format(parts[1], parts[3])]
+    return []
+
+
+def _macos_scutil_nameservers() -> list[str]:
+    servers = []
+    for raw in run(["scutil", "--dns"]).stdout.splitlines():
+        match = re.match(r"^\s*nameserver\[\d+\]\s*:\s*(\S+)$", raw)
+        if match:
+            servers.append(match.group(1))
+    return servers
+
+
+def _macos_lsof_processes() -> dict[tuple[str, str], str]:
+    """Map ``(protocol, port)`` to a ``command,pid=N`` label.
+
+    ``lsof`` only reports sockets owned by the current user unless run as root,
+    so this is best-effort enrichment layered on top of ``netstat``.
+    """
+    mapping: dict[tuple[str, str], str] = {}
+    if not command_exists("lsof"):
+        return mapping
+    commands = [
+        ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-FpcPn"],
+        ["lsof", "-nP", "-iUDP", "-FpcPn"],
+    ]
+    for cmd in commands:
+        pid = ""
+        name = ""
+        proto = ""
+        for raw in run(cmd).stdout.splitlines():
+            if not raw:
+                continue
+            tag, value = raw[0], raw[1:]
+            if tag == "p":
+                pid = value
+                name = ""
+            elif tag == "c":
+                name = value
+            elif tag == "P":
+                proto = value.lower()
+            elif tag == "n":
+                addr = value.split("->", 1)[0]
+                if ":" not in addr:
+                    continue
+                port = addr.rsplit(":", 1)[1]
+                if not port or port == "*":
+                    continue
+                key = (proto or "tcp", port)
+                if name and key not in mapping:
+                    mapping[key] = "{0},pid={1}".format(name, pid)
+    return mapping
+
+
+def _macos_split_addr(value: str, proto_family: str) -> tuple[str, str]:
+    """Split macOS ``netstat`` ``ADDRESS.PORT`` notation."""
+    value = value.strip()
+    if "." not in value:
+        return value, ""
+    host, port = value.rsplit(".", 1)
+    if host == "*":
+        host = "::" if proto_family.endswith("6") else "0.0.0.0"
+    return host, port
+
+
+def _macos_listening_ports() -> list[dict[str, Any]]:
+    processes = _macos_lsof_processes()
+    rows: list[dict[str, Any]] = []
+    for proto in ("tcp", "udp"):
+        result = run(["netstat", "-an", "-p", proto])
+        for raw in result.stdout.splitlines():
+            parts = raw.split()
+            if len(parts) < 4 or not parts[0].startswith(proto):
+                continue
+            if proto == "tcp" and "LISTEN" not in parts:
+                continue
+            family = parts[0]
+            host, port = _macos_split_addr(parts[3], family)
+            if not port or port == "*":
+                continue
+            rows.append(
+                {
+                    "proto": proto,
+                    "address": host,
+                    "port": port,
+                    "process": processes.get((proto, port), ""),
+                }
+            )
+    return rows
+
+
+def _macos_firewall() -> dict[str, Any]:
+    summary: list[str] = []
+    tools: list[str] = []
+    if Path(MACOS_APP_FIREWALL).exists():
+        for flag in ("--getglobalstate", "--getblockall", "--getstealthmode"):
+            result = run([MACOS_APP_FIREWALL, flag])
+            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            if result.returncode == 0 and lines:
+                summary.append(lines[0])
+        if summary:
+            tools.append("socketfilterfw")
+
+    pf_result = run(["pfctl", "-s", "info"])
+    pf_lines = [line.strip() for line in pf_result.stdout.splitlines() if line.strip()]
+    if pf_result.returncode == 0 and pf_lines:
+        tools.append("pfctl")
+        summary.extend(pf_lines[:4])
+    elif command_exists("pfctl"):
+        summary.append("pfctl: state not readable without root (partial data)")
+
+    return {
+        "tool": "+".join(tools) if tools else "none",
+        "summary": summary[:12],
+    }
+
+
+def _collect_network_darwin() -> dict[str, Any]:
+    dns_servers = resolv_conf_nameservers()
+    if not dns_servers:
+        dns_servers = _macos_scutil_nameservers()
+    return {
+        "primary_ips": _macos_primary_ips(),
+        "default_route": _macos_default_route(),
+        "dns_servers": dns_servers,
+        "listening_ports": _macos_listening_ports(),
+        "firewall": _macos_firewall(),
+    }
+
+
 def systemd_status(unit: str) -> dict[str, str]:
     if not command_exists("systemctl"):
         return {"unit": unit, "status": "unknown"}
@@ -208,8 +491,62 @@ def systemd_status(unit: str) -> dict[str, str]:
     return {"unit": unit, "status": status}
 
 
+def launchd_status(unit: str) -> dict[str, str]:
+    """macOS equivalent of ``systemctl is-active`` for a service name or label."""
+    if not command_exists("launchctl"):
+        return {"unit": unit, "status": "unknown"}
+    spec = MACOS_SERVICES.get(unit, {"labels": (unit,), "command": None})
+    labels = spec["labels"]
+
+    for raw in run(["launchctl", "list"]).stdout.splitlines():
+        cols = raw.split("\t")
+        if len(cols) < 3:
+            continue
+        pid, _status, label = cols[0].strip(), cols[1].strip(), cols[2].strip()
+        if not any(label == item or label.startswith(item) for item in labels):
+            continue
+        return {"unit": label, "status": "active" if pid not in ("", "-") else "loaded"}
+
+    for label in labels:
+        result = run(["launchctl", "print", "system/{0}".format(label.rstrip("."))])
+        if result.returncode != 0:
+            continue
+        match = re.search(r"^\s*state\s*=\s*(.+?)\s*$", result.stdout, re.MULTILINE)
+        if not match:
+            continue
+        state = match.group(1).strip()
+        if state == "running":
+            return {"unit": label, "status": "active"}
+        return {"unit": label, "status": "loaded"}
+
+    command = spec.get("command")
+    if command and not command_exists(command):
+        return {"unit": unit, "status": "not-installed"}
+    return {"unit": unit, "status": "unknown"}
+
+
+def service_status(unit: str) -> dict[str, str]:
+    return launchd_status(unit) if IS_DARWIN else systemd_status(unit)
+
+
+def _docker_status_darwin() -> dict[str, str]:
+    """Derive Docker status by reachability, not by service name.
+
+    macOS has no ``docker`` launchd job: the daemon lives inside a VM managed by
+    Docker Desktop, colima, OrbStack, Rancher Desktop, ... Asking launchd for a
+    unit called "docker" always answers "unknown", which then contradicts a
+    populated container list in the same document. Probing the socket is both
+    truthful and provider-agnostic.
+    """
+    if not command_exists("docker"):
+        return {"unit": "docker", "status": "not-installed"}
+    if run(["docker", "info"]).returncode == 0:
+        return {"unit": "docker", "status": "active"}
+    return {"unit": "docker", "status": "inactive"}
+
+
 def collect_docker() -> dict[str, Any]:
-    status = systemd_status("docker")
+    status = _docker_status_darwin() if IS_DARWIN else service_status("docker")
     containers: list[dict[str, Any]] = []
     if command_exists("docker"):
         result = run(
@@ -237,7 +574,7 @@ def collect_docker() -> dict[str, Any]:
     }
 
 
-def nginx_config_summary() -> dict[str, Any]:
+def _nginx_config_paths_linux() -> list[str]:
     config_paths = []
     if Path("/etc/nginx/nginx.conf").exists():
         config_paths.append("/etc/nginx/nginx.conf")
@@ -246,6 +583,28 @@ def nginx_config_summary() -> dict[str, Any]:
         for path in sorted(enabled.iterdir()):
             if path.is_file() or path.is_symlink():
                 config_paths.append(str(path))
+    return config_paths
+
+
+def _nginx_config_paths_darwin() -> list[str]:
+    config_paths = _nginx_config_paths_linux()
+    for prefix in MACOS_BREW_PREFIXES:
+        base = Path(prefix) / "etc" / "nginx"
+        conf = base / "nginx.conf"
+        if conf.exists():
+            config_paths.append(str(conf))
+        for sub in ("servers", "sites-enabled"):
+            directory = base / sub
+            if not directory.exists():
+                continue
+            for path in sorted(directory.iterdir()):
+                if path.is_file() or path.is_symlink():
+                    config_paths.append(str(path))
+    return config_paths
+
+
+def nginx_config_summary() -> dict[str, Any]:
+    config_paths = _nginx_config_paths_darwin() if IS_DARWIN else _nginx_config_paths_linux()
 
     listens: list[str] = []
     server_names: list[str] = []
@@ -278,7 +637,7 @@ def nginx_config_summary() -> dict[str, Any]:
         output = (result.stderr or result.stdout).strip().splitlines()
         test_summary = output[-1] if output else ""
 
-    status = systemd_status("nginx")
+    status = service_status("nginx")
     return {
         "status": status["status"],
         "config_paths": sorted(dict.fromkeys(config_paths)),
@@ -324,9 +683,9 @@ def ssh_summary() -> dict[str, Any]:
             if key in settings:
                 settings[key].append(value.strip())
 
-    status = systemd_status("ssh")
+    status = service_status("ssh")
     if status["status"] == "unknown":
-        status = systemd_status("sshd")
+        status = service_status("sshd")
 
     return {
         "status": status["status"],
@@ -349,7 +708,7 @@ def collect_services() -> dict[str, Any]:
     }
 
 
-def postgresql_units() -> list[str]:
+def _postgresql_units_linux() -> list[str]:
     if not command_exists("systemctl"):
         return []
     result = run(["systemctl", "list-units", "--type=service", "--all", "postgresql*.service"])
@@ -359,6 +718,24 @@ def postgresql_units() -> list[str]:
         if parts and parts[0].startswith("postgresql"):
             units.append(parts[0])
     return sorted(dict.fromkeys(units))
+
+
+def _postgresql_units_darwin() -> list[str]:
+    if not command_exists("launchctl"):
+        return []
+    units = []
+    for raw in run(["launchctl", "list"]).stdout.splitlines():
+        cols = raw.split("\t")
+        if len(cols) < 3:
+            continue
+        label = cols[2].strip()
+        if "postgres" in label.lower():
+            units.append(label)
+    return sorted(dict.fromkeys(units))
+
+
+def postgresql_units() -> list[str]:
+    return _postgresql_units_darwin() if IS_DARWIN else _postgresql_units_linux()
 
 
 def psql_query(sql: str) -> list[str]:
@@ -378,10 +755,16 @@ def postgresql_config_paths() -> list[str]:
     paths = []
     if POSTGRESQL_COMPOSE_PATH.exists():
         paths.append(str(POSTGRESQL_COMPOSE_PATH))
-    for candidate in [
+    candidates = [
         Path("/etc/postgresql"),
         Path("/var/lib/postgresql"),
-    ]:
+    ]
+    if IS_DARWIN:
+        for prefix in MACOS_BREW_PREFIXES:
+            candidates.append(Path(prefix) / "var" / "postgres")
+            candidates.extend(sorted(Path(prefix).glob("var/postgresql*")))
+            candidates.append(Path(prefix) / "etc" / "postgresql")
+    for candidate in candidates:
         if candidate.exists():
             for path in candidate.rglob("postgresql.conf"):
                 paths.append(str(path))
@@ -423,7 +806,7 @@ def collect_postgresql() -> dict[str, Any]:
     units = postgresql_units()
     status = "not-found"
     if units:
-        statuses = [systemd_status(unit)["status"] for unit in units]
+        statuses = [service_status(unit)["status"] for unit in units]
         status = ", ".join(sorted(dict.fromkeys(statuses)))
     elif command_exists("psql"):
         status = "present"
@@ -544,6 +927,88 @@ def snap_tools() -> list[dict[str, Any]]:
     return normalize_records(rows, "name")
 
 
+def _brew_executables(prefix: str, formula: str) -> list[str]:
+    if not prefix:
+        return []
+    short_name = formula.split("/")[-1]
+    executables: list[str] = []
+    for sub in ("bin", "sbin"):
+        directory = Path(prefix) / "opt" / short_name / sub
+        if not directory.is_dir():
+            continue
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            continue
+        for path in entries:
+            if path.is_file() and os.access(str(path), os.X_OK):
+                executables.append(path.name)
+    return sorted(dict.fromkeys(executables))
+
+
+def brew_tools() -> list[dict[str, Any]]:
+    """Homebrew formulae/casks — the macOS analogue of `apt-mark showmanual`."""
+    if not command_exists("brew"):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    version_line = run(["brew", "--version"]).stdout.strip().splitlines()
+    brew_version = "unknown"
+    if version_line:
+        match = re.search(r"(\d[\w.\-]*)", version_line[0])
+        if match:
+            brew_version = match.group(1)
+    rows.append(
+        {
+            "name": "homebrew",
+            "source": "homebrew",
+            "version": brew_version,
+            "executables": ["brew"],
+        }
+    )
+
+    prefix = run(["brew", "--prefix"]).stdout.strip()
+    versions: dict[str, str] = {}
+    for raw in run(["brew", "list", "--versions"]).stdout.splitlines():
+        parts = raw.split()
+        if len(parts) >= 2:
+            versions[parts[0]] = parts[1]
+
+    leaves = run(["brew", "leaves", "--installed-on-request"])
+    for raw in leaves.stdout.splitlines():
+        formula = raw.strip()
+        if not formula:
+            continue
+        executables = _brew_executables(prefix, formula)
+        if not executables:
+            continue
+        short_name = formula.split("/")[-1]
+        rows.append(
+            {
+                "name": short_name,
+                "source": "homebrew",
+                "version": versions.get(short_name, "unknown"),
+                "executables": executables,
+            }
+        )
+
+    for raw in run(["brew", "list", "--cask", "--versions"]).stdout.splitlines():
+        parts = raw.split()
+        if not parts:
+            continue
+        rows.append(
+            {
+                "name": parts[0],
+                "source": "homebrew-cask",
+                "version": parts[1] if len(parts) > 1 else "unknown",
+                "executables": [],
+                "notes": "cask",
+            }
+        )
+
+    return normalize_records(rows, "name")
+
+
 def npm_tools() -> list[dict[str, Any]]:
     if not command_exists("npm"):
         return []
@@ -554,7 +1019,13 @@ def npm_tools() -> list[dict[str, Any]]:
     rows = []
     if not root.exists():
         return rows
-    for package_json in root.glob("*/package.json"):
+    # Scoped packages live one level deeper (@scope/name/package.json), so a
+    # single "*/package.json" glob silently misses things like
+    # @anthropic-ai/claude-code and @openai/codex.
+    package_jsons = sorted(
+        set(root.glob("*/package.json")) | set(root.glob("@*/*/package.json"))
+    )
+    for package_json in package_jsons:
         try:
             data = json.loads(package_json.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -668,11 +1139,17 @@ def uv_tools() -> list[dict[str, Any]]:
     return normalize_records(rows, "name")
 
 
+def system_package_tools() -> list[dict[str, Any]]:
+    """OS package-manager sourced tools, dispatched per platform."""
+    if IS_DARWIN:
+        return brew_tools()
+    return apt_tools() + snap_tools()
+
+
 def collect_software() -> dict[str, Any]:
     manual_rows = parse_manual_software(docs_home() / "manual-software.txt")
     all_rows = (
-        apt_tools()
-        + snap_tools()
+        system_package_tools()
         + npm_tools()
         + python_console_tools()
         + uv_tools()

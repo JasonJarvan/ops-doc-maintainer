@@ -1,6 +1,6 @@
 ---
 name: ops-doc-maintainer
-description: Maintain hotspot-only operations documentation for a host (Linux or Windows). Use when you need to inventory network/listening-port state, VPN/proxy (Clash, WireGuard, etc.), Docker, Nginx/IIS, SSH/WinRM, PostgreSQL (Linux only), Windows Services, or manually installed global CLI tools, and when another agent has just installed or changed software and the shared ops docs must be updated. Cross-platform: auto-detects Linux vs Windows on every invocation.
+description: Maintain hotspot-only operations documentation for a host (Linux, macOS, or Windows). Use when you need to inventory network/listening-port state, VPN/proxy (Clash, WireGuard, etc.), Docker, Nginx/IIS, SSH/WinRM, PostgreSQL (Linux/macOS only), Windows Services, or manually installed global CLI tools, and when another agent has just installed or changed software and the shared ops docs must be updated. Cross-platform: auto-detects Linux, macOS, and Windows on every invocation.
 ---
 
 # Ops Doc Maintainer
@@ -18,6 +18,26 @@ On every invocation, detect the host platform and use the matching subtree:
 
 Detection rule: `python -c "import platform; print(platform.system())"` → `Linux`/`Darwin` use Linux subtree, `Windows` uses Windows subtree. The dispatcher script `scripts/update_ops_docs.py` does this automatically — prefer it over invoking the subtree directly.
 
+### macOS (Darwin) behaviour
+
+The `linux` subtree branches internally on `platform.system() == "Darwin"`. The output schema, docs layout, templates, and `snapshots/latest.json` diffing are identical across Linux and macOS; only the collectors differ.
+
+| Domain | Linux | macOS |
+|---|---|---|
+| IPs / route | `hostname -I`, `ip route show default` | `ifconfig`, `route -n get default` (falls back to `netstat -rn`) |
+| DNS | `/etc/resolv.conf` | `/etc/resolv.conf`, falls back to `scutil --dns` |
+| Listening ports | `ss -ltnupH` | `netstat -an -p tcp/udp`, process names enriched from `lsof -nP` |
+| Firewall | `ufw` / `nft` | `socketfilterfw --getglobalstate/--getblockall/--getstealthmode` plus `pfctl -s info` when root |
+| Service status | `systemctl is-active` | `launchctl list` / `launchctl print system/<label>` |
+| Packages | `apt-mark showmanual`, `snap list` | `brew leaves --installed-on-request` + `brew list --cask` (no snap equivalent) |
+
+macOS notes:
+
+- `pfctl` needs root; without it the firewall summary records a partial-data line instead of failing.
+- `lsof` only sees the current user's sockets unless run as root, so ports are listed from `netstat` and process names are best-effort.
+- The library widens `PATH` on macOS only (Homebrew, `~/.local/bin`, `~/.cargo/bin`, newest `~/.nvm` node) so agent runtimes with a minimal `PATH` still detect brew/npm/uv tools. Linux `PATH` handling is unchanged.
+- A missing command is never fatal on any platform: it degrades to empty output with return code 127.
+
 ## What This Skill Maintains
 
 Hotspot-only host docs. Records change history, never low-value static inventory (OS, CPU, memory, disks).
@@ -29,7 +49,7 @@ Hotspot-only host docs. Records change history, never low-value static inventory
 - manually installed global executable tools
 - meaningful change history
 
-**Linux-specific:** Nginx, SSH, PostgreSQL (connection guidance and config paths only — no databases/users/connections).
+**Linux/macOS-specific:** Nginx, SSH, PostgreSQL (connection guidance and config paths only — no databases/users/connections).
 
 **Windows-specific:** network adapters with VPN/proxy detection (Clash, Mihomo, WireGuard, V2Ray, TUN/TAP, system proxy), Windows Services (non-system/non-Microsoft only), IIS, WinRM, startup items, user-created scheduled tasks. SQL Server is explicitly out of scope.
 
