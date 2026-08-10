@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
+import unicodedata
 from datetime import datetime, timezone
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +32,42 @@ PROXY_PROCESS_NAMES = {
 
 # Ports commonly used by local proxy/VPN processes
 PROXY_PORTS = {7890, 7891, 7892, 1080, 1081, 10808, 10809, 10810, 8080, 8118, 3128}
+
+# Chocolatey rows that are runtime/dependency noise rather than manually
+# installed CLI tools. Matches the "no dependency-only packages" rule in
+# references/windows/software-detection-rules.md.
+_CHOCO_NOISE_EXACT = {
+    "chocolatey",
+    "chocolatey-compatibility.extension",
+    "chocolatey-core.extension",
+    "chocolatey-dotnetfx.extension",
+    "chocolatey-visualstudio.extension",
+    "chocolatey-windowsupdate.extension",
+    "dotnetfx",
+    "visualstudio-installer",
+}
+# Upper bound on winget rows kept in the docs. Exceeding it is reported in the
+# output rather than silently dropped.
+_WINGET_MAX = 300
+
+# winget package ids that are shared runtimes/redistributables pulled in as
+# dependencies, not tools someone installed on purpose.
+_WINGET_NOISE_PATTERNS = (
+    re.compile(r"^Microsoft\.VCRedist\.", re.IGNORECASE),
+    re.compile(r"^Microsoft\.VCLibs\.", re.IGNORECASE),
+    re.compile(r"^Microsoft\.UI\.Xaml\.", re.IGNORECASE),
+    re.compile(r"^Microsoft\.DotNet\.(Native|DesktopRuntime|AspNetCore|HostingBundle|Runtime)", re.IGNORECASE),
+    re.compile(r"^Microsoft\.WindowsAppRuntime", re.IGNORECASE),
+    re.compile(r"^Microsoft\.EdgeWebView", re.IGNORECASE),
+)
+
+_CHOCO_NOISE_PATTERNS = (
+    re.compile(r"^KB\d+$", re.IGNORECASE),          # Windows update payloads
+    re.compile(r"^vcredist", re.IGNORECASE),        # VC++ redistributables
+    re.compile(r"\.extension$", re.IGNORECASE),     # chocolatey helper extensions
+    re.compile(r"\.install$", re.IGNORECASE),       # packaging split artefacts
+    re.compile(r"\.portable$", re.IGNORECASE),
+)
 
 # Windows built-in service name prefixes to suppress
 _SYSTEM_SERVICE_NAMES = {
@@ -100,10 +139,25 @@ def _run_ps(cmd: str, timeout: int = 30) -> str:
         return ""
 
 
+def _resolve_exe(name: str) -> str | None:
+    """Resolve a command to a concrete path.
+
+    Many Windows dev tools ship as ``.cmd``/``.bat`` shims (npm, scoop, yarn).
+    ``subprocess`` without a shell cannot launch a bare ``npm``, so resolve
+    through PATH/PATHEXT first and hand CreateProcess a full path.
+    """
+    return shutil.which(name)
+
+
 def _run_cmd(args: list[str], timeout: int = 30) -> str:
+    if not args:
+        return ""
+    resolved = _resolve_exe(args[0])
+    if resolved is None:
+        return ""
     try:
         r = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout,
+            [resolved, *args[1:]], capture_output=True, text=True, timeout=timeout,
             encoding="utf-8", errors="replace",
         )
         return r.stdout.strip()
@@ -322,23 +376,47 @@ def collect_network() -> dict:
 # Services collection
 # ---------------------------------------------------------------------------
 
+def _service_image_path(path_name: str) -> str:
+    """Extract the executable out of a Win32_Service PathName."""
+    raw = (path_name or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith('"'):
+        end = raw.find('"', 1)
+        return raw[1:end] if end > 0 else raw[1:]
+    match = re.match(r"^(.*?\.exe)(?:\s|$)", raw, re.IGNORECASE)
+    return match.group(1) if match else raw.split(" ", 1)[0]
+
+
 def _notable_services() -> list[dict]:
+    # Win32_Service reports State/StartMode as strings ("Running", "Auto") and
+    # exposes PathName. Get-Service would serialise its enums as bare integers
+    # through ConvertTo-Json, which renders as an unreadable "- 4".
     items = _ps_json(
-        "Get-Service | Where-Object { $_.Status -eq 'Running' -or $_.StartType -eq 'Automatic' }"
-        " | Select-Object Name, DisplayName, Status, StartType | ConvertTo-Json -Depth 2"
+        "Get-CimInstance Win32_Service"
+        " | Where-Object { $_.State -eq 'Running' -or $_.StartMode -eq 'Auto' }"
+        " | Select-Object Name, DisplayName, State, StartMode, PathName"
+        " | ConvertTo-Json -Depth 2"
     )
+    windir = (os.environ.get("SystemRoot") or r"C:\Windows").rstrip("\\").lower()
     notable = []
     for item in items:
-        name = item.get("Name", "")
+        name = item.get("Name", "") or ""
         if name in _SYSTEM_SERVICE_NAMES:
+            continue
+        image = _service_image_path(item.get("PathName", ""))
+        # Anything shipped under %SystemRoot% is an OS service, not a hotspot.
+        if image and image.lower().startswith(windir + os.sep):
             continue
         notable.append({
             "name": name,
-            "display_name": item.get("DisplayName", ""),
-            "status": item.get("Status", ""),
-            "start_type": item.get("StartType", ""),
+            "display_name": item.get("DisplayName", "") or "",
+            "status": item.get("State", "") or "",
+            "start_type": item.get("StartMode", "") or "",
+            "image_path": image,
         })
-    return notable[:30]
+    notable.sort(key=lambda svc: svc["name"].lower())
+    return notable[:40]
 
 
 def _docker() -> dict:
@@ -387,13 +465,13 @@ def _iis() -> dict:
 
 def _winrm() -> dict:
     items = _ps_json(
-        "Get-Service WinRM -ErrorAction SilentlyContinue"
-        " | Select-Object Status, StartType | ConvertTo-Json"
+        "Get-CimInstance Win32_Service -Filter \"Name='WinRM'\" -ErrorAction SilentlyContinue"
+        " | Select-Object State, StartMode | ConvertTo-Json"
     )
     if not items:
         return {"status": "not_available"}
     item = items[0]
-    return {"status": item.get("Status", ""), "start_type": item.get("StartType", "")}
+    return {"status": item.get("State", ""), "start_type": item.get("StartMode", "")}
 
 
 def _startup_items() -> list[dict]:
@@ -445,6 +523,52 @@ def collect_services() -> dict:
 # Software collection
 # ---------------------------------------------------------------------------
 
+def _display_width(text: str) -> int:
+    """Terminal cell width of a string (CJK glyphs occupy two cells)."""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def _header_columns(header: str) -> list[int]:
+    """Display-column offsets where each header field starts.
+
+    A field may itself contain single spaces, so tokens are only broken on runs
+    of two or more spaces.
+    """
+    return [
+        _display_width(header[: match.start()])
+        for match in re.finditer(r"\S(?:[^\s]|\s(?!\s))*", header)
+    ]
+
+
+def _split_by_columns(line: str, columns: list[int]) -> list[str]:
+    """Slice a padded table row at the given display-column offsets.
+
+    Indexing by code point would drift on rows containing CJK names, because
+    winget pads by display width, not character count.
+    """
+    bounds: list[int] = []
+    target = 0
+    width = 0
+    for idx, ch in enumerate(line):
+        while target < len(columns) and width >= columns[target]:
+            bounds.append(idx)
+            target += 1
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    while target < len(columns):
+        bounds.append(len(line))
+        target += 1
+
+    fields = []
+    for i, start in enumerate(bounds):
+        end = bounds[i + 1] if i + 1 < len(bounds) else len(line)
+        fields.append(line[start:end].strip())
+    return fields
+
+
+def _is_winget_noise(package_id: str) -> bool:
+    return any(pattern.search(package_id) for pattern in _WINGET_NOISE_PATTERNS)
+
+
 def _winget_packages() -> list[dict]:
     raw = _run_cmd(
         ["winget", "list", "--source", "winget", "--disable-interactivity"],
@@ -452,24 +576,65 @@ def _winget_packages() -> list[dict]:
     )
     if not raw:
         return []
+
+    lines = raw.splitlines()
+
+    # Locale-independent header detection. winget localises its column titles
+    # ("Name/Id/Version" in English, "名称/ID/版本" in zh-CN, and so on), so
+    # matching the English words drops every row on a non-English host.
+    # The dashed rule under the header is not localised, so anchor on that.
+    sep_idx = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and set(stripped) <= {"-", "─", "—"}:
+            sep_idx = idx
+            break
+    if sep_idx is None or sep_idx == 0:
+        return []
+
+    header = lines[sep_idx - 1]
+    # winget pads columns to a fixed display width, so the only reliable split
+    # is by column offset. Whitespace splitting corrupts any row whose name
+    # contains a double space ("Microsoft Visual C++ 2010  x64 Redistributable").
+    columns = _header_columns(header)
+    if len(columns) < 2:
+        return []
+
     packages = []
-    header_seen = False
-    for line in raw.splitlines():
-        if not header_seen:
-            if "Name" in line and "Id" in line and "Version" in line:
-                header_seen = True
+    truncated = False
+    for line in lines[sep_idx + 1:]:
+        stripped = line.strip()
+        if not stripped:
             continue
-        if re.match(r"^[-\s]+$", line):
+        # winget streams spinner/progress glyphs on some terminals.
+        if set(stripped) <= set("-\\|/ ─█░"):
             continue
-        parts = re.split(r"\s{2,}", line.strip())
-        if len(parts) >= 2:
-            packages.append({
-                "name": parts[0],
-                "id": parts[1] if len(parts) > 1 else "",
-                "version": parts[2] if len(parts) > 2 else "",
-                "source": "winget",
-            })
-    return packages[:100]
+        fields = _split_by_columns(line, columns)
+        name = fields[0] if fields else ""
+        pkg_id = fields[1] if len(fields) > 1 else ""
+        version = fields[2] if len(fields) > 2 else ""
+        if not name or not pkg_id:
+            continue
+        if _is_winget_noise(pkg_id):
+            continue
+        if len(packages) >= _WINGET_MAX:
+            truncated = True
+            break
+        packages.append({
+            "name": name,
+            "id": pkg_id,
+            "version": version,
+            "source": "winget",
+        })
+    if truncated:
+        # Never let a cap look like a complete inventory.
+        packages.append({
+            "name": f"(truncated at {_WINGET_MAX} entries)",
+            "id": "",
+            "version": "",
+            "source": "winget",
+        })
+    return packages
 
 
 def _scoop_packages() -> list[dict]:
@@ -491,6 +656,12 @@ def _scoop_packages() -> list[dict]:
     return packages
 
 
+def _is_choco_noise(name: str) -> bool:
+    if name.lower() in {item.lower() for item in _CHOCO_NOISE_EXACT}:
+        return True
+    return any(pattern.search(name) for pattern in _CHOCO_NOISE_PATTERNS)
+
+
 def _choco_packages() -> list[dict]:
     raw = _run_cmd(["choco", "list", "--local-only", "--limit-output"], timeout=30)
     if not raw:
@@ -500,10 +671,106 @@ def _choco_packages() -> list[dict]:
         line = line.strip()
         if "|" in line:
             parts = line.split("|")
+            name = parts[0]
+            if _is_choco_noise(name):
+                continue
             packages.append({
-                "name": parts[0],
+                "name": name,
                 "version": parts[1] if len(parts) > 1 else "",
                 "source": "chocolatey",
+            })
+    return packages
+
+
+def _npm_packages() -> list[dict]:
+    """Global npm CLI packages, matched to the Linux collector's semantics."""
+    root_raw = _run_cmd(["npm", "root", "-g"], timeout=60)
+    if not root_raw:
+        return []
+    root = Path(root_raw.splitlines()[0].strip())
+    if not root.is_dir():
+        return []
+
+    packages = []
+    # Scoped packages live one level deeper (@scope/name/package.json).
+    candidates = list(root.glob("*/package.json")) + list(root.glob("@*/*/package.json"))
+    for package_json in candidates:
+        try:
+            data = json.loads(package_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        name = data.get("name")
+        bin_field = data.get("bin", {})
+        if isinstance(bin_field, str):
+            executables = [name] if name else []
+        elif isinstance(bin_field, dict):
+            executables = sorted(bin_field.keys())
+        else:
+            executables = []
+        if not name or not executables:
+            continue  # libraries without an entry point are not global tools
+        packages.append({
+            "name": name,
+            "version": data.get("version", ""),
+            "executables": executables,
+            "source": "npm-global",
+        })
+    return sorted(packages, key=lambda item: item["name"].lower())
+
+
+def _pip_console_tools() -> list[dict]:
+    """Top-level pip packages that expose console scripts."""
+    raw = _run_cmd(["python", "-m", "pip", "list", "--not-required", "--format=json"], timeout=90)
+    if not raw:
+        return []
+    try:
+        requested = {
+            item["name"].lower(): item.get("version", "")
+            for item in json.loads(raw)
+            if item.get("name")
+        }
+    except (json.JSONDecodeError, TypeError, KeyError):
+        return []
+
+    packages = []
+    for dist in metadata.distributions():
+        try:
+            name = dist.metadata["Name"]
+        except (KeyError, TypeError):
+            name = None
+        if not name or name.lower() not in requested:
+            continue
+        executables = sorted(
+            {ep.name for ep in dist.entry_points if ep.group == "console_scripts" and ep.name}
+        )
+        if not executables:
+            continue
+        packages.append({
+            "name": name,
+            "version": dist.version or requested.get(name.lower(), ""),
+            "executables": executables,
+            "source": "pip",
+        })
+    return sorted(packages, key=lambda item: item["name"].lower())
+
+
+def _uv_tools() -> list[dict]:
+    raw = _run_cmd(["uv", "tool", "list"], timeout=30)
+    if not raw:
+        return []
+    packages = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("-") or line.lower().startswith("no tools"):
+            continue
+        match = re.match(r"^([A-Za-z0-9_.-]+)\s+v?(\S+)", line)
+        if match:
+            name, version = match.groups()
+            packages.append({
+                "name": name,
+                "version": version,
+                "executables": [name],
+                "source": "uv",
             })
     return packages
 
@@ -531,6 +798,9 @@ def collect_software(docs_home: Path) -> dict:
         "winget": _winget_packages(),
         "scoop": _scoop_packages(),
         "chocolatey": _choco_packages(),
+        "npm-global": _npm_packages(),
+        "pip": _pip_console_tools(),
+        "uv": _uv_tools(),
         "manual": _manual_packages(docs_home),
     }
 
@@ -620,11 +890,17 @@ def _render_services(data: dict, hostname: str, updated_at: str) -> str:
     lines += ["\n## WinRM\n"]
     lines.append(f"- Status: {winrm.get('status','?')}, StartType: {winrm.get('start_type','?')}")
 
-    lines += ["\n## Notable Running Services\n"]
+    # The list also carries Automatic-but-stopped services, so it is not a
+    # "running" list.
+    lines += ["\n## Notable Services (Non-System)\n"]
     svcs = data.get("notable_services", [])
     if svcs:
         for svc in svcs:
-            lines.append(f"- `{svc['name']}` {svc['display_name']} — {svc['status']}")
+            start = svc.get("start_type", "")
+            suffix = f" (start: {start})" if start else ""
+            lines.append(
+                f"- `{svc['name']}` {svc['display_name']} — {svc.get('status','?')}{suffix}"
+            )
     else:
         lines.append("- None detected outside system defaults")
 
@@ -664,6 +940,16 @@ def _render_software(data: dict, hostname: str, updated_at: str) -> str:
         lines += [f"\n## chocolatey ({len(choco)} packages)\n"]
         for p in choco:
             lines.append(f"- {p['name']} {p.get('version','')}")
+
+    for source, title in (("npm-global", "npm (global)"), ("pip", "pip"), ("uv", "uv tools")):
+        items = data.get(source, [])
+        if not items:
+            continue
+        lines += [f"\n## {title} ({len(items)} packages)\n"]
+        for p in items:
+            execs = ", ".join(p.get("executables", []))
+            suffix = f" | executables: {execs}" if execs else ""
+            lines.append(f"- {p['name']} {p.get('version','')}{suffix}")
 
     manual = data.get("manual", [])
     if manual:
@@ -715,13 +1001,9 @@ def _render_index(
     if iis.get("status") != "not_installed":
         lines.append(f"- IIS: {len(iis.get('sites', []))} site(s)")
 
-    total = (
-        len(software.get("winget", []))
-        + len(software.get("scoop", []))
-        + len(software.get("chocolatey", []))
-        + len(software.get("manual", []))
-    )
-    lines.append(f"- Tracked packages: {total} (winget/scoop/choco/manual)")
+    sources = ("winget", "scoop", "chocolatey", "npm-global", "pip", "uv", "manual")
+    total = sum(len(software.get(source, [])) for source in sources)
+    lines.append(f"- Tracked packages: {total} (winget/scoop/choco/npm/pip/uv/manual)")
 
     return "\n".join(lines)
 
@@ -768,7 +1050,7 @@ def _meaningful_changes(old: dict, new: dict) -> list[str]:
     old_sw = old.get("software", {})
     new_sw = new.get("software", {})
     if new_sw:
-        for source in ("winget", "scoop", "chocolatey"):
+        for source in ("winget", "scoop", "chocolatey", "npm-global", "pip", "uv"):
             old_pkgs = {p["name"]: p.get("version", "") for p in old_sw.get(source, [])}
             new_pkgs = {p["name"]: p.get("version", "") for p in new_sw.get(source, [])}
             for name in sorted(set(new_pkgs) - set(old_pkgs)):

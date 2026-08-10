@@ -18,6 +18,8 @@ On every invocation, detect the host platform and use the matching subtree:
 
 Detection rule: `python -c "import platform; print(platform.system())"` → `Linux`/`Darwin` use Linux subtree, `Windows` uses Windows subtree. The dispatcher script `scripts/update_ops_docs.py` does this automatically — prefer it over invoking the subtree directly.
 
+**Windows docs-home fallback:** when neither `WIN_OPS_DOCS_HOME` nor `OPS_DOCS_HOME` is set and `~/.ops-doc-maintainer-docs/` already exists, the Windows implementation adopts that directory instead of creating `~/.win-ops-doc-maintainer-docs/`. This keeps one docs home per host, but it also means a run will overwrite current-state docs that were previously written by hand or by the Linux subtree. Set `WIN_OPS_DOCS_HOME` to a scratch path when trialling the collectors on a host whose docs you do not want replaced.
+
 ### macOS (Darwin) behaviour
 
 The `linux` subtree branches internally on `platform.system() == "Darwin"`. The output schema, docs layout, templates, and `snapshots/latest.json` diffing are identical across Linux and macOS; only the collectors differ.
@@ -52,6 +54,10 @@ Hotspot-only host docs. Records change history, never low-value static inventory
 **Linux/macOS-specific:** Nginx, SSH, PostgreSQL (connection guidance and config paths only — no databases/users/connections).
 
 **Windows-specific:** network adapters with VPN/proxy detection (Clash, Mihomo, WireGuard, V2Ray, TUN/TAP, system proxy), Windows Services (non-system/non-Microsoft only), IIS, WinRM, startup items, user-created scheduled tasks. SQL Server is explicitly out of scope.
+
+Windows package sources: `winget`, `scoop`, `chocolatey`, `npm-global`, `pip`, `uv`, plus `manual-software.txt`.
+
+Service filtering uses the service binary path: anything whose image sits under `%SystemRoot%` is treated as an OS service and dropped. Vendor driver services that install into `C:\Windows\System32` (GPU, chipset) are filtered out by the same rule — add them to `watchlist.txt` if a host needs them tracked.
 
 ## When To Use It
 
